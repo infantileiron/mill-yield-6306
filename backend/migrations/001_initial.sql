@@ -2,3 +2,11 @@
 -- This migration documents the business keys used for idempotent demo seed.
 -- batches.code UNIQUE; inspections.sample_code UNIQUE; users.email UNIQUE.
 -- reviews stores immutable JSON snapshots, result checksum and approver identity.
+
+-- 批次归并（同一车原粮误建多批号）：
+-- batch_groups.code UNIQUE；status: active / dissolved；verified_tonnes 为核实吨数。
+-- batch_group_members 保留成员履历，解除归并不删行；
+--   同一批号同时只能属于一个 active 组，由服务层行锁保证，无数据库部分唯一索引依赖。
+-- idempotency_ops.key PRIMARY KEY：归并确认的客户端幂等键，重试同号操作返回首次结果。
+-- inspections.batch_id 始终指向录入入口批号，归并/解除不改写样本行（追加留痕）。
+-- reviews.context 为提交时刻的归并口径 JSON；后续归并变化不改变既有诊断依据。

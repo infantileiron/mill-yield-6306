@@ -7,9 +7,10 @@
 青禾质量组原来把供应商批次写进 `原粮到货-1115.xlsx`，检验员录入不同工作簿，分析员手算四分位数，负责人在群里确认。问题是样本与批次容易错位、计算口径随人员变化、签核意见无法回到当时的数据。本项目承接原粮入厂检验，输出带冻结样本和 SHA-256 的复核 CSV，供产线负责人安排复测。
 
 - 批次台账：供应商、产线、吨数、日期、样本数，唯一业务编号。
-- 检验录入：出粉率、水分、检验员，范围校验和重复编号阻断。
-- 分布诊断：按产线冻结快照，Redis 排队由独立 Python worker 计算，显示完整样本直方图、分位数、IQR 异常点和分组均值。
-- 复核报告：负责人签核意见，分析员与观察员可下载含原始样本的 CSV。
+- 批次归并：同一车原粮误建多个批号时，先预览成员、样本数与核实吨数再确认；归并组吨数只计一次、样本各计一次；旧批号仍可补录，解除归并按原入口批号还原（含归并期间补录的样本），并可查批号归属来历。
+- 检验录入：出粉率、水分、检验员，范围校验和重复编号阻断；样本始终挂在录入入口批号，追加留痕不改写。
+- 分布诊断：按产线冻结快照（含录入入口批号与当时归并组的完整归属），Redis 排队由独立 Python worker 计算，显示完整样本直方图、分位数、IQR 异常点和分组均值；排队后归并变化不改变既有诊断依据。
+- 复核报告：负责人签核意见，分析员与观察员可下载含原始样本、原批号与当时归并组的 CSV。
 - JWT 三角色、写操作审计、每分钟请求限流、可恢复的错误提示。
 
 ## 账号与权限
@@ -63,7 +64,18 @@ docker compose down -v --remove-orphans
 - 分组按原粮产线计算 n、均值、最小、最大。异常点不从总体统计中移除。
 - 结果带样本快照 SHA-256，同一冻结输入可复现。统计异常只是核对线索，不自动判废。
 
-后台 worker 从 Redis 消费复核 id，更新 queued→running→completed/failed，写结果至共享 artifacts 卷。重启时会扫描未完成任务并重新排队。负责人仅能签核 completed 状态，签核后不可重复签核。CSV 导出包含状态、口径值、签核意见和所有冻结样本。
+后台 worker 从 Redis 消费复核 id，更新 queued→running→completed/failed，写结果至共享 artifacts 卷（可用 `ARTIFACT_DIR` 覆盖默认 `/artifacts`）。重启时会扫描未完成任务并重新排队。负责人仅能签核 completed 状态，签核后不可重复签核。CSV 导出包含状态、口径值、签核意见、归并口径和所有冻结样本。
+
+## 批次归并口径与并发约定
+
+同一车原粮被误建成多个批号时，台账毛吨数会重复统计。批次归并不改写任何检验行，只建立批号之间的归并关系：
+
+- **预览后确认**：`POST /merges/preview` 返回成员批号、各自样本数、成员吨数合计、同产线/同供应商校验结果与占用冲突；`POST /merges/confirm` 携带客户端 `idempotency_key` 确认，归并组按「核实吨数」只计一次，成员样本各计一次。同号重试返回首次结果（`idempotent_reused=true`），不重复建组。
+- **旧批号补录**：`inspections.batch_id` 始终是录入入口批号。归并期间向成员批号补录的样本，实时带上当前归并组；解除归并后自动按原入口批号还原，无样本迁移或丢失。
+- **解除与依赖**：`POST /merges/{id}/dissolve` 把归并组置为 dissolved 并保留成员履历，重复解除自然幂等。若成员批号已被另一个生效归并组引用（后续归并），必须先解除依赖组。解除后允许用相同编号重新归并——`batch_groups.code` 的唯一约束是仅针对 active 行的部分唯一索引。
+- **并发安全**：确认归并按批次 id 排序加 `SELECT ... FOR UPDATE` 行锁，并发归并、解除与补录在同一批行上串行化；冲突返回 409，整体回滚保持原状，不会串批。失败的归并不落幂等记录，修正参数后同键可重试。
+- **归属来历**：`GET /batches/{id}/attribution` 返回批号当前生效归并组与全部历史履历（加入/解除时间、主批号、成员清单、操作人）。
+- **诊断冻结**：复核提交时把完整归属（入口批号 + 当时归并组）写入 `reviews.snapshot`，归并口径写入 `reviews.context`；排队或完成后的归并/解除不改变既有复核单，旧诊断与旧 CSV 仍按冻结时数据读取。导出 CSV 含「录入入口批号」「当时归并组」两列及归并组核实吨数口径。
 
 ## 一天的工作剧本
 
@@ -78,7 +90,7 @@ docker compose down -v --remove-orphans
 
 ## 目录与本地开发
 
-`backend/src` 按 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分职责；`backend/scripts` 是幂等 seed；`backend/migrations` 记录初始 schema 约定，实际表结构由 SQLAlchemy `create_all` 应用。`frontend/src` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分模块。
+`backend/src` 按 routes/controllers/services/models/schemas/middlewares/utils/constants/config 分职责（归并领域逻辑在 `services/merges.py`）；`backend/scripts` 是幂等 seed；`backend/migrations` 记录初始 schema 约定，实际表结构由 SQLAlchemy `create_all` 应用；`backend/tests` 是基于 FastAPI TestClient + fakeredis 的归并端到端测试（14 项，含并发与幂等）。`frontend/src` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分模块。
 
 本地 Python 开发：安装 `backend/requirements.txt`，配置 `DATABASE_URL` / `REDIS_URL` / `JWT_SECRET`，在 backend 目录执行 `uvicorn src.main:app --reload` 与 `python -m src.worker`。静态前端通过 Nginx `/api/` 代理后端无前缀路由，不需要 Node 构建。
 

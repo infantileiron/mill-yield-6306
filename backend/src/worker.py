@@ -1,10 +1,12 @@
-import time,os,traceback
+import time, os, traceback
 from pathlib import Path
 from sqlalchemy import select
-from src.config.database import Session,Base,engine
+from src.config.database import Session, Base, engine
 from src.models.entities import Review
 from src.services.business import queue
 from src.services.statistics import diagnose
+
+ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", "/artifacts")
 Base.metadata.create_all(engine)
 # Recover committed jobs if a process stopped between database commit and queue push.
 with Session() as db:
@@ -18,8 +20,8 @@ while True:
         if not obj or obj.status not in ('queued','running'):continue
         obj.status='running';db.commit()
         try:
-            obj.result=diagnose(obj.snapshot);obj.status='completed'
-            Path('/artifacts').mkdir(exist_ok=True)
-            Path(f'/artifacts/review-{obj.id}.json').write_text(__import__('json').dumps(obj.result,ensure_ascii=False))
+            obj.result = diagnose(obj.snapshot); obj.status = 'completed'
+            Path(ARTIFACT_DIR).mkdir(exist_ok=True)
+            Path(f'{ARTIFACT_DIR}/review-{obj.id}.json').write_text(__import__('json').dumps(obj.result, ensure_ascii=False))
         except Exception as e:obj.status='failed';obj.note=str(e);traceback.print_exc()
         db.commit()
